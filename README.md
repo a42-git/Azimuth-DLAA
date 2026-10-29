@@ -62,8 +62,6 @@ A small troubleshooting log is written to:
 
 `fh2_dlss.log`
 
-The public build does **not** dump shaders or root signatures and does not include the old motion-vector debug overlay.
-
 When reporting a problem, please include:
 
 - `fh2_dlss.log`
