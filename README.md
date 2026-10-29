@@ -1,6 +1,6 @@
 # Azimuth-DLAA
 
-NVIDIA DLAA support for games running through [Azimuth](https://almost-there-games.itch.io/azimuth).
+NVIDIA DLAA support for Forza games running through [Azimuth](https://almost-there-games.itch.io/azimuth).
 
 > **Current support:** Forza Horizon 2 is the first supported game. Support for other Azimuth titles is planned, but they are not supported by the current public build yet.
 
