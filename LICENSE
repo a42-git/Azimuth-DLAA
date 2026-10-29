@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 a42-git
+Copyright (c) 2026 Guilherme Fernandes Medeiros
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,3 +19,14 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+UPSTREAM CREDIT
+
+FH2-DLAA is based on FH2-FSR4 by aranhoso / Guilherme Fernandes Medeiros:
+https://github.com/aranhoso/FH2-FSR4
+
+The original copyright notice above is retained from the upstream project.
+
+This MIT License covers the source code distributed with FH2-DLAA.
+NVIDIA DLSS/NGX SDK components are governed by NVIDIA's license in
+LICENSE-NVIDIA-DLSS.txt.
