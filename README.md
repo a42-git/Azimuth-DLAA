@@ -2,8 +2,6 @@
 
 NVIDIA DLAA support for Forza games running through [Azimuth](https://almost-there-games.itch.io/azimuth).
 
-> **Current support:** Forza Horizon 2 is the first supported game. Support for other Azimuth titles is planned, but they are not supported by the current public build yet.
-
 Azimuth-DLAA is an unofficial community mod and is not affiliated with NVIDIA, Microsoft, Xbox, Playground Games, Turn 10 Studios, or Almost There Games.
 
 ## Supported games
@@ -11,7 +9,7 @@ Azimuth-DLAA is an unofficial community mod and is not affiliated with NVIDIA, M
 | Game | Status |
 | --- | --- |
 | Forza Horizon 2 | ✅ Supported |
-| Storm Island | ✅ Supported |
+| Storm Island DLC | ✅ Supported |
 | Forza Horizon 2 Presents Fast & Furious | ✅ Supported |
 | Forza Horizon 3 | 🚧 Planned / not working yet |
 | Forza Motorsport 5 | ⚠️ Untested |
