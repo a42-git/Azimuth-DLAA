@@ -1,0 +1,1131 @@
+/* FH2 DLAA: NVIDIA DLAA (DLSS) for Azimuth (jitter and full-resolution motion vectors).
+   Loaded as dxgi.dll next to azimuth.exe. Hooks D3D12CreateDevice through the exe's
+   import table, then device / command-list / factory / swap-chain vtables. */
+#define COBJMACROS
+#define INITGUID
+#include <windows.h>
+#include <d3d12.h>
+#include <dxgi1_4.h>
+#include <d3dcompiler.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "shaders.h"
+#include "common.h"
+
+HMODULE proxy_system_dxgi(void);
+
+/* ---------------------------------------------------------------- logging */
+
+static CRITICAL_SECTION log_lock;
+static HANDLE log_file = INVALID_HANDLE_VALUE;
+
+void log_msg(const char *fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf) - 2, fmt, ap);
+    va_end(ap);
+    if (n < 0) {
+        return;
+    }
+    if (n > (int)sizeof(buf) - 3) {
+        n = sizeof(buf) - 3;
+    }
+    buf[n++] = '\r';
+    buf[n++] = '\n';
+    EnterCriticalSection(&log_lock);
+    if (log_file != INVALID_HANDLE_VALUE) {
+        DWORD written;
+        WriteFile(log_file, buf, (DWORD)n, &written, NULL);
+    }
+    LeaveCriticalSection(&log_lock);
+}
+
+/* ---------------------------------------------------------------- patching */
+
+static void patch_slot(void **slot, void *hook, void **original) {
+    if (*slot == hook) {
+        return;
+    }
+    DWORD old;
+    VirtualProtect(slot, sizeof(void *), PAGE_EXECUTE_READWRITE, &old);
+    if (original && !*original) {
+        *original = *slot;
+    }
+    *slot = hook;
+    VirtualProtect(slot, sizeof(void *), old, &old);
+}
+
+#define VT_SLOT(obj, Vtbl, Method) ((void **)&((Vtbl *)(*(void **)(obj)))->Method)
+
+/* ---------------------------------------------------------------- globals */
+
+/* DXBC checksums of the Azimuth 1.0.3 FH2 passes used by the stable path. */
+static const DWORD MV_PS_HASH[4] = {0x8a12870f, 0x60f7c6e9, 0x21d28459, 0x07b63a84};
+static const DWORD RESOLVE_PS_HASH[4] = {0x1549a8f9, 0xd8526d4b, 0x60608dd5, 0x6ae7bb32};
+
+enum { ROLE_NONE, ROLE_MV, ROLE_RESOLVE };
+
+typedef HRESULT(WINAPI *PFN_Compile)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO *,
+                                     ID3DInclude *, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob **,
+                                     ID3DBlob **);
+
+static SRWLOCK pso_lock = SRWLOCK_INIT;
+static ID3D12Device *g_device;
+
+/* Game PSOs we recognise, with our full-resolution variant for the motion-vector pass. */
+#define MAX_VARIANTS 32
+static struct {
+    ID3D12PipelineState *original, *variant;
+    int role;
+} variants[MAX_VARIANTS];
+
+
+/* Scene resources, found at the resolve draw. States are tracked from the game's barriers. */
+static ID3D12Resource *scene_color, *scene_depth;
+static volatile LONG scene_color_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+static volatile LONG scene_depth_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+/* RTV/DSV descriptor -> resource, from the device's view-creation calls. */
+typedef struct {
+    SIZE_T handle;
+    ID3D12Resource *resource;
+    DXGI_FORMAT format;   /* view format, or resource format when the view had no desc */
+    UINT width, height;
+} ViewEntry;
+#define MAX_VIEWS 16384
+static ViewEntry views[MAX_VIEWS];
+
+/* Motion-vector target. */
+static ID3D12Resource *mv_tex;
+static UINT mv_w, mv_h;
+static ID3D12DescriptorHeap *rtv_heap;   /* 0: MV, 1..4: back buffers */
+static UINT rtv_inc;
+static volatile LONG64 present_count;
+static ID3D12Resource *retired[16];
+static LONG64 retired_at[16];
+static SRWLOCK mv_lock = SRWLOCK_INIT;
+
+
+/* ---------------------------------------------------------------- originals */
+
+static HRESULT(WINAPI *real_D3D12CreateDevice)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
+static HRESULT(STDMETHODCALLTYPE *real_CreateGraphicsPipelineState)(ID3D12Device *, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *, REFIID, void **);
+static HRESULT(STDMETHODCALLTYPE *real_CreateCommandList)(ID3D12Device *, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *, ID3D12PipelineState *, REFIID, void **);
+static HRESULT(STDMETHODCALLTYPE *real_Reset)(ID3D12GraphicsCommandList *, ID3D12CommandAllocator *, ID3D12PipelineState *);
+static void(STDMETHODCALLTYPE *real_SetPipelineState)(ID3D12GraphicsCommandList *, ID3D12PipelineState *);
+static void(STDMETHODCALLTYPE *real_OMSetRenderTargets)(ID3D12GraphicsCommandList *, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE *, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE *);
+static void(STDMETHODCALLTYPE *real_RSSetViewports)(ID3D12GraphicsCommandList *, UINT, const D3D12_VIEWPORT *);
+static void(STDMETHODCALLTYPE *real_RSSetScissorRects)(ID3D12GraphicsCommandList *, UINT, const D3D12_RECT *);
+static void(STDMETHODCALLTYPE *real_DrawInstanced)(ID3D12GraphicsCommandList *, UINT, UINT, UINT, UINT);
+static void(STDMETHODCALLTYPE *real_DrawIndexedInstanced)(ID3D12GraphicsCommandList *, UINT, UINT, UINT, INT, UINT);
+static void(STDMETHODCALLTYPE *real_ResourceBarrier)(ID3D12GraphicsCommandList *, UINT, const D3D12_RESOURCE_BARRIER *);
+static void(STDMETHODCALLTYPE *real_SetDescriptorHeaps)(ID3D12GraphicsCommandList *, UINT, ID3D12DescriptorHeap *const *);
+static void(STDMETHODCALLTYPE *real_SetComputeRootSignature)(ID3D12GraphicsCommandList *, ID3D12RootSignature *);
+static void(STDMETHODCALLTYPE *real_SetGraphicsRootSignature)(ID3D12GraphicsCommandList *, ID3D12RootSignature *);
+static void(STDMETHODCALLTYPE *real_SetGraphicsRootDescriptorTable)(ID3D12GraphicsCommandList *, UINT, D3D12_GPU_DESCRIPTOR_HANDLE);
+static void(STDMETHODCALLTYPE *real_CreateRenderTargetView)(ID3D12Device *, ID3D12Resource *, const D3D12_RENDER_TARGET_VIEW_DESC *, D3D12_CPU_DESCRIPTOR_HANDLE);
+static void(STDMETHODCALLTYPE *real_CreateDepthStencilView)(ID3D12Device *, ID3D12Resource *, const D3D12_DEPTH_STENCIL_VIEW_DESC *, D3D12_CPU_DESCRIPTOR_HANDLE);
+static HRESULT(WINAPI *real_CreateDXGIFactory)(REFIID, void **);
+static HRESULT(WINAPI *real_CreateDXGIFactory1)(REFIID, void **);
+static HRESULT(WINAPI *real_CreateDXGIFactory2)(UINT, REFIID, void **);
+static HRESULT(STDMETHODCALLTYPE *real_CreateSwapChainForHwnd)(IDXGIFactory2 *, IUnknown *, HWND, const DXGI_SWAP_CHAIN_DESC1 *, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *, IDXGIOutput *, IDXGISwapChain1 **);
+static HRESULT(STDMETHODCALLTYPE *real_Present)(IDXGISwapChain *, UINT, UINT);
+static HRESULT(STDMETHODCALLTYPE *real_Present1)(IDXGISwapChain1 *, UINT, UINT, const DXGI_PRESENT_PARAMETERS *);
+
+/* ---------------------------------------------------------------- shaders */
+
+static ID3DBlob *compile(const char *src, const char *entry, const char *target) {
+    static PFN_Compile fn;
+    if (!fn) {
+        HMODULE m = LoadLibraryExW(L"d3dcompiler_47.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        fn = m ? (PFN_Compile)(void *)GetProcAddress(m, "D3DCompile") : NULL;
+        if (!fn) {
+            log_msg("d3dcompiler_47 unavailable");
+            return NULL;
+        }
+    }
+    ID3DBlob *code = NULL, *errors = NULL;
+    HRESULT hr = fn(src, strlen(src), entry, NULL, NULL, entry, target,
+                    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
+    if (FAILED(hr)) {
+        log_msg("compile %s/%s failed 0x%08lx: %s", entry, target, hr,
+             errors ? (const char *)ID3D10Blob_GetBufferPointer(errors) : "?");
+    }
+    if (errors) {
+        ID3D10Blob_Release(errors);
+    }
+    return SUCCEEDED(hr) ? code : NULL;
+}
+
+static int shader_role(const D3D12_SHADER_BYTECODE *ps) {
+    if (!ps->pShaderBytecode || ps->BytecodeLength < 20) {
+        return ROLE_NONE;
+    }
+    const BYTE *b = ps->pShaderBytecode;
+    if (memcmp(b, "DXBC", 4)) {
+        return ROLE_NONE;
+    }
+    DWORD h[4];
+    memcpy(h, b + 4, 16);
+    if (!memcmp(h, MV_PS_HASH, 16)) {
+        return ROLE_MV;
+    }
+    if (!memcmp(h, RESOLVE_PS_HASH, 16)) {
+        return ROLE_RESOLVE;
+    }
+    return ROLE_NONE;
+}
+
+/* ---------------------------------------------------------------- PSO hook */
+
+static int pso_known(ID3D12PipelineState *pso);
+
+static void remember_pso(ID3D12PipelineState *pso, ID3D12PipelineState *variant, int role) {
+    AcquireSRWLockExclusive(&pso_lock);
+    int i = 0;
+    for (; i < MAX_VARIANTS && variants[i].original; ++i) {
+    }
+    if (i < MAX_VARIANTS) {
+        variants[i].original = pso;
+        variants[i].variant = variant;
+        variants[i].role = role;
+        variant = NULL;
+    }
+    ReleaseSRWLockExclusive(&pso_lock);
+    if (variant) {
+        ID3D12PipelineState_Release(variant);
+        log_msg("PSO table full");
+    }
+}
+
+/* Records the game passes we key on; builds our full-resolution variant of the motion-vector pass. */
+static void consider_pso(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, ID3D12PipelineState *pso) {
+    if (!desc || !pso || !g_device) {
+        return;
+    }
+    int role = shader_role(&desc->PS);
+    if (role == ROLE_NONE || pso_known(pso)) {
+        return;
+    }
+    if (role == ROLE_RESOLVE) {
+        remember_pso(pso, NULL, role);
+        static LONG logged_resolve;
+        if (!InterlockedExchange(&logged_resolve, 1)) {
+            log_msg("scene resolve pass found");
+        }
+        return;
+    }
+    ID3DBlob *ps = compile(MV_PS_HLSL, "main", "ps_5_0");
+    if (!ps) {
+        return;
+    }
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC d = *desc;
+    d.PS.pShaderBytecode = ID3D10Blob_GetBufferPointer(ps);
+    d.PS.BytecodeLength = ID3D10Blob_GetBufferSize(ps);
+    d.NumRenderTargets = 1;
+    for (int i = 0; i < 8; ++i) {
+        d.RTVFormats[i] = DXGI_FORMAT_UNKNOWN;
+    }
+    d.RTVFormats[0] = DXGI_FORMAT_R16G16_FLOAT;
+    d.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    d.DepthStencilState.DepthEnable = FALSE;
+    d.DepthStencilState.StencilEnable = FALSE;
+    memset(&d.BlendState, 0, sizeof(d.BlendState));
+    d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    d.SampleDesc.Count = 1;
+    d.SampleDesc.Quality = 0;
+    d.SampleMask = UINT_MAX;
+    d.CachedPSO.pCachedBlob = NULL;
+    d.CachedPSO.CachedBlobSizeInBytes = 0;
+    ID3D12PipelineState *variant = NULL;
+    HRESULT vhr = real_CreateGraphicsPipelineState(g_device, &d, &IID_ID3D12PipelineState, (void **)&variant);
+    ID3D10Blob_Release(ps);
+    if (FAILED(vhr)) {
+        log_msg("motion-vector variant PSO failed 0x%08lx", vhr);
+        return;
+    }
+    remember_pso(pso, variant, ROLE_MV);
+    static LONG logged_mv;
+    if (!InterlockedExchange(&logged_mv, 1)) {
+        log_msg("motion-vector pass found; full-resolution variant ready");
+    }
+}
+
+static HRESULT STDMETHODCALLTYPE hook_CreateGraphicsPipelineState(
+    ID3D12Device *dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {
+    HRESULT hr = real_CreateGraphicsPipelineState(dev, desc, riid, out);
+    if (SUCCEEDED(hr) && out && *out) {
+        consider_pso(desc, (ID3D12PipelineState *)*out);
+    }
+    return hr;
+}
+
+static HRESULT(STDMETHODCALLTYPE *real_LoadGraphicsPipeline)(ID3D12PipelineLibrary *, LPCWSTR, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *, REFIID, void **);
+static HRESULT(STDMETHODCALLTYPE *real_CreatePipelineLibrary)(ID3D12Device1 *, const void *, SIZE_T, REFIID, void **);
+
+static HRESULT STDMETHODCALLTYPE hook_LoadGraphicsPipeline(ID3D12PipelineLibrary *lib, LPCWSTR name,
+                                                           const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc,
+                                                           REFIID riid, void **out) {
+    HRESULT hr = real_LoadGraphicsPipeline(lib, name, desc, riid, out);
+    if (SUCCEEDED(hr) && out && *out) {
+        consider_pso(desc, (ID3D12PipelineState *)*out);
+    }
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE hook_CreatePipelineLibrary(ID3D12Device1 *dev, const void *blob, SIZE_T size,
+                                                            REFIID riid, void **out) {
+    HRESULT hr = real_CreatePipelineLibrary(dev, blob, size, riid, out);
+    if (SUCCEEDED(hr) && out && *out) {
+        patch_slot(VT_SLOT(*out, ID3D12PipelineLibraryVtbl, LoadGraphicsPipeline), (void *)hook_LoadGraphicsPipeline,
+                   (void **)&real_LoadGraphicsPipeline);
+        static LONG logged;
+        if (!InterlockedExchange(&logged, 1)) {
+            log_msg("pipeline library hooked");
+        }
+    }
+    return hr;
+}
+
+static int pso_lookup(ID3D12PipelineState *pso, ID3D12PipelineState **variant) {
+    int role = ROLE_NONE;
+    if (!pso) {
+        return role;
+    }
+    AcquireSRWLockShared(&pso_lock);
+    for (int i = 0; i < MAX_VARIANTS && variants[i].original; ++i) {
+        if (variants[i].original == pso) {
+            role = variants[i].role;
+            if (variant) {
+                *variant = variants[i].variant;
+            }
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&pso_lock);
+    return role;
+}
+
+static int pso_known(ID3D12PipelineState *pso) {
+    return pso_lookup(pso, NULL) != ROLE_NONE;
+}
+
+/* ---------------------------------------------------------------- command-list state */
+
+typedef struct {
+    ID3D12GraphicsCommandList *list;
+    ID3D12PipelineState *pso;
+    UINT num_rtv;
+    BOOL rtv_single;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv[8];
+    BOOL has_dsv;
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv;
+    BOOL dsv_scene;      /* the scene depth buffer is bound: viewports get the DLSS jitter */
+    BOOL vp_jittered;
+    UINT num_vp, num_sc;
+    D3D12_VIEWPORT vp[4]; /* as the game set them (unjittered) */
+    D3D12_RECT sc[4];
+    UINT num_heaps;
+    ID3D12DescriptorHeap *heaps[2];
+    ID3D12RootSignature *compute_rs;
+    UINT tables_mask;
+    D3D12_GPU_DESCRIPTOR_HANDLE tables[32];
+} ListState;
+
+/* Azimuth creates command lists continually and never tells us when one dies, so this
+   is an open-addressed table that evicts on overflow; Reset reinitialises an entry
+   when a freed address is reused for a new list. */
+#define MAX_LISTS 4096
+#define PROBE 16
+static ListState lists[MAX_LISTS];
+static SRWLOCK list_lock = SRWLOCK_INIT;
+
+static UINT list_hash(ID3D12GraphicsCommandList *cl) {
+    UINT64 v = (UINT64)(uintptr_t)cl >> 4;
+    return (UINT)((v * 0x9E3779B97F4A7C15ull) >> 52) & (MAX_LISTS - 1);
+}
+
+static ListState *state_for(ID3D12GraphicsCommandList *cl) {
+    UINT h = list_hash(cl);
+    for (UINT i = 0; i < PROBE; ++i) {
+        ListState *s = &lists[(h + i) & (MAX_LISTS - 1)];
+        if (s->list == cl) {
+            return s;
+        }
+    }
+    AcquireSRWLockExclusive(&list_lock);
+    ListState *s = NULL;
+    for (UINT i = 0; i < PROBE; ++i) {
+        ListState *c = &lists[(h + i) & (MAX_LISTS - 1)];
+        if (c->list == cl) {
+            s = c;
+            break;
+        }
+        if (!s && !c->list) {
+            s = c;
+        }
+    }
+    if (!s) {
+        static UINT victim;
+        s = &lists[(h + (victim++ % PROBE)) & (MAX_LISTS - 1)];
+    }
+    if (s->list != cl) {
+        memset(s, 0, sizeof(*s));
+        s->list = cl;
+    }
+    ReleaseSRWLockExclusive(&list_lock);
+    return s;
+}
+
+/* ---------------------------------------------------------------- view map */
+
+static UINT view_hash(SIZE_T handle) {
+    return (UINT)(((UINT64)handle * 0x9E3779B97F4A7C15ull) >> 50) & (MAX_VIEWS - 1);
+}
+
+static void view_record(D3D12_CPU_DESCRIPTOR_HANDLE h, ID3D12Resource *res, DXGI_FORMAT view_format) {
+    UINT i = view_hash(h.ptr);
+    ViewEntry *e = NULL;
+    for (UINT k = 0; k < 32; ++k) {
+        ViewEntry *c = &views[(i + k) & (MAX_VIEWS - 1)];
+        if (c->handle == h.ptr || !c->handle) {
+            e = c;
+            break;
+        }
+    }
+    if (!e) {
+        e = &views[i]; /* evict */
+    }
+    UINT w = 0, ht = 0;
+    DXGI_FORMAT f = view_format;
+    if (res) {
+        D3D12_RESOURCE_DESC d;
+        res->lpVtbl->GetDesc(res, &d);
+        w = (UINT)d.Width;
+        ht = d.Height;
+        if (f == DXGI_FORMAT_UNKNOWN) {
+            f = d.Format;
+        }
+    }
+    e->format = f;
+    e->width = w;
+    e->height = ht;
+    e->resource = res;
+    e->handle = h.ptr;
+}
+
+static const ViewEntry *view_find(SIZE_T handle) {
+    UINT i = view_hash(handle);
+    for (UINT k = 0; k < 32; ++k) {
+        const ViewEntry *c = &views[(i + k) & (MAX_VIEWS - 1)];
+        if (c->handle == handle) {
+            return c;
+        }
+        if (!c->handle) {
+            break;
+        }
+    }
+    return NULL;
+}
+
+static void STDMETHODCALLTYPE hook_CreateRenderTargetView(ID3D12Device *dev, ID3D12Resource *res,
+                                                          const D3D12_RENDER_TARGET_VIEW_DESC *desc,
+                                                          D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    real_CreateRenderTargetView(dev, res, desc, h);
+    view_record(h, res, desc ? desc->Format : DXGI_FORMAT_UNKNOWN);
+}
+
+static void STDMETHODCALLTYPE hook_CreateDepthStencilView(ID3D12Device *dev, ID3D12Resource *res,
+                                                          const D3D12_DEPTH_STENCIL_VIEW_DESC *desc,
+                                                          D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    real_CreateDepthStencilView(dev, res, desc, h);
+    view_record(h, res, desc ? desc->Format : DXGI_FORMAT_UNKNOWN);
+}
+
+/* The scene depth buffer: depth+stencil at the scene colour's size (found at the resolve). */
+static BOOL is_scene_dsv(D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    const ViewEntry *e = view_find(h.ptr);
+    if (!e || !scene_color) {
+        return FALSE;
+    }
+    BOOL depth_stencil = e->format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT || e->format == DXGI_FORMAT_R32G8X24_TYPELESS;
+    D3D12_RESOURCE_DESC d;
+    scene_color->lpVtbl->GetDesc(scene_color, &d);
+    return depth_stencil && e->width == d.Width && e->height == d.Height;
+}
+
+/* ---------------------------------------------------------------- list hooks */
+
+static void apply_viewports(ID3D12GraphicsCommandList *cl, ListState *s) {
+    float jx, jy;
+    if (s->dsv_scene && s->num_vp && dlss_jitter(&jx, &jy)) {
+        D3D12_VIEWPORT vp[4];
+        memcpy(vp, s->vp, s->num_vp * sizeof(*vp));
+        for (UINT i = 0; i < s->num_vp; ++i) {
+            vp[i].TopLeftX += jx;
+            vp[i].TopLeftY += jy;
+        }
+        real_RSSetViewports(cl, s->num_vp, vp);
+        s->vp_jittered = TRUE;
+    } else {
+        if (s->num_vp) {
+            real_RSSetViewports(cl, s->num_vp, s->vp);
+        }
+        s->vp_jittered = FALSE;
+    }
+}
+
+static HRESULT STDMETHODCALLTYPE hook_Reset(ID3D12GraphicsCommandList *cl, ID3D12CommandAllocator *a,
+                                            ID3D12PipelineState *pso) {
+    ListState *s = state_for(cl);
+    if (s) {
+        memset((char *)s + sizeof(s->list), 0, sizeof(*s) - sizeof(s->list));
+        s->pso = pso;
+    }
+    return real_Reset(cl, a, pso);
+}
+
+static void STDMETHODCALLTYPE hook_SetPipelineState(ID3D12GraphicsCommandList *cl, ID3D12PipelineState *pso) {
+    ListState *s = state_for(cl);
+    if (s) {
+        s->pso = pso;
+    }
+    real_SetPipelineState(cl, pso);
+}
+
+static void STDMETHODCALLTYPE hook_OMSetRenderTargets(ID3D12GraphicsCommandList *cl, UINT n,
+                                                      const D3D12_CPU_DESCRIPTOR_HANDLE *rt, BOOL single,
+                                                      const D3D12_CPU_DESCRIPTOR_HANDLE *ds) {
+    real_OMSetRenderTargets(cl, n, rt, single, ds);
+    ListState *s = state_for(cl);
+    if (s) {
+        s->num_rtv = n > 8 ? 8 : n;
+        s->rtv_single = single;
+        if (rt && n) {
+            memcpy(s->rtv, rt, (single ? 1 : s->num_rtv) * sizeof(*rt));
+        }
+        s->has_dsv = ds != NULL;
+        if (ds) {
+            s->dsv = *ds;
+        }
+        BOOL scene = ds && is_scene_dsv(*ds);
+        if (scene != s->dsv_scene) {
+            s->dsv_scene = scene;
+            if (s->num_vp && (scene || s->vp_jittered)) {
+                apply_viewports(cl, s);
+            }
+        }
+    }
+}
+
+static void STDMETHODCALLTYPE hook_RSSetViewports(ID3D12GraphicsCommandList *cl, UINT n, const D3D12_VIEWPORT *vp) {
+    ListState *s = state_for(cl);
+    if (!s || !n || !vp) {
+        real_RSSetViewports(cl, n, vp);
+        return;
+    }
+    s->num_vp = n > 4 ? 4 : n;
+    memcpy(s->vp, vp, s->num_vp * sizeof(*vp));
+    if (s->dsv_scene) {
+        apply_viewports(cl, s);
+    } else {
+        real_RSSetViewports(cl, n, vp);
+        s->vp_jittered = FALSE;
+    }
+}
+
+static void STDMETHODCALLTYPE hook_RSSetScissorRects(ID3D12GraphicsCommandList *cl, UINT n, const D3D12_RECT *r) {
+    ListState *s = state_for(cl);
+    if (s) {
+        s->num_sc = n > 4 ? 4 : n;
+        memcpy(s->sc, r, s->num_sc * sizeof(*r));
+    }
+    real_RSSetScissorRects(cl, n, r);
+}
+
+static void STDMETHODCALLTYPE hook_SetDescriptorHeaps(ID3D12GraphicsCommandList *cl, UINT n, ID3D12DescriptorHeap *const *h) {
+    ListState *s = state_for(cl);
+    if (s) {
+        s->num_heaps = n > 2 ? 2 : n;
+        memcpy(s->heaps, h, s->num_heaps * sizeof(*h));
+    }
+    real_SetDescriptorHeaps(cl, n, h);
+}
+
+static void STDMETHODCALLTYPE hook_SetComputeRootSignature(ID3D12GraphicsCommandList *cl, ID3D12RootSignature *rs) {
+    ListState *s = state_for(cl);
+    if (s) {
+        s->compute_rs = rs;
+    }
+    real_SetComputeRootSignature(cl, rs);
+}
+
+static void STDMETHODCALLTYPE hook_SetGraphicsRootSignature(ID3D12GraphicsCommandList *cl, ID3D12RootSignature *rs) {
+    ListState *s = state_for(cl);
+    if (s) {
+        s->tables_mask = 0;
+    }
+    real_SetGraphicsRootSignature(cl, rs);
+}
+
+static void STDMETHODCALLTYPE hook_SetGraphicsRootDescriptorTable(ID3D12GraphicsCommandList *cl, UINT index,
+                                                                  D3D12_GPU_DESCRIPTOR_HANDLE base) {
+    ListState *s = state_for(cl);
+    if (s && index < 32) {
+        s->tables[index] = base;
+        s->tables_mask |= 1u << index;
+    }
+    real_SetGraphicsRootDescriptorTable(cl, index, base);
+}
+
+static void STDMETHODCALLTYPE hook_ResourceBarrier(ID3D12GraphicsCommandList *cl, UINT n, const D3D12_RESOURCE_BARRIER *b) {
+    ID3D12Resource *color = scene_color, *depth = scene_depth;
+    if (color || depth) {
+        for (UINT i = 0; i < n; ++i) {
+            if (b[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
+                continue;
+            }
+            if (b[i].Transition.pResource == color) {
+                InterlockedExchange(&scene_color_state, (LONG)b[i].Transition.StateAfter);
+            } else if (b[i].Transition.pResource == depth) {
+                InterlockedExchange(&scene_depth_state, (LONG)b[i].Transition.StateAfter);
+            }
+        }
+    }
+    real_ResourceBarrier(cl, n, b);
+}
+
+void hooks_transition(ID3D12GraphicsCommandList *cl, ID3D12Resource *r, D3D12_RESOURCE_STATES from,
+                      D3D12_RESOURCE_STATES to) {
+    D3D12_RESOURCE_BARRIER b;
+    memset(&b, 0, sizeof(b));
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = r;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = from;
+    b.Transition.StateAfter = to;
+    real_ResourceBarrier(cl, 1, &b);
+}
+
+/* After DLSS has recorded its compute work into the game's list, put back what it changed. */
+static void restore_after_dlss(ID3D12GraphicsCommandList *cl, ListState *s) {
+    if (s->num_heaps) {
+        real_SetDescriptorHeaps(cl, s->num_heaps, s->heaps);
+    }
+    if (s->compute_rs) {
+        real_SetComputeRootSignature(cl, s->compute_rs);
+    }
+    for (UINT i = 0; i < 32; ++i) {
+        if (s->tables_mask & (1u << i)) {
+            real_SetGraphicsRootDescriptorTable(cl, i, s->tables[i]);
+        }
+    }
+    real_SetPipelineState(cl, s->pso);
+}
+
+/* ---------------------------------------------------------------- MV target */
+
+#define transition hooks_transition
+
+static D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle(ID3D12DescriptorHeap *heap, UINT index, UINT inc) {
+    D3D12_CPU_DESCRIPTOR_HANDLE h;
+    heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(heap, &h);
+    h.ptr += (SIZE_T)index * inc;
+    return h;
+}
+
+static int ensure_heaps(void) {
+    if (rtv_heap) {
+        return 1;
+    }
+    D3D12_DESCRIPTOR_HEAP_DESC hd;
+    memset(&hd, 0, sizeof(hd));
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    hd.NumDescriptors = 1;
+    if (FAILED(ID3D12Device_CreateDescriptorHeap(g_device, &hd, &IID_ID3D12DescriptorHeap, (void **)&rtv_heap))) {
+        return 0;
+    }
+    rtv_inc = ID3D12Device_GetDescriptorHandleIncrementSize(g_device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    return 1;
+}
+
+/* Called under mv_lock (exclusive). */
+static int ensure_mv(UINT w, UINT h) {
+    if (mv_tex && mv_w == w && mv_h == h) {
+        return 1;
+    }
+    if (!g_device || !ensure_heaps()) {
+        return 0;
+    }
+    if (mv_tex) {
+        for (int i = 0; i < 16; ++i) {
+            if (!retired[i]) {
+                retired[i] = mv_tex;
+                retired_at[i] = present_count;
+                mv_tex = NULL;
+                break;
+            }
+        }
+        if (mv_tex) {
+            return 0; /* nowhere to park the old one; try again later */
+        }
+    }
+    D3D12_HEAP_PROPERTIES hp;
+    memset(&hp, 0, sizeof(hp));
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd;
+    memset(&rd, 0, sizeof(rd));
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = w;
+    rd.Height = h;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R16G16_FLOAT;
+    rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    D3D12_CLEAR_VALUE cv;
+    memset(&cv, 0, sizeof(cv));
+    cv.Format = rd.Format;
+    if (FAILED(ID3D12Device_CreateCommittedResource(g_device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv,
+                                                    &IID_ID3D12Resource, (void **)&mv_tex))) {
+        log_msg("motion-vector texture %ux%u creation failed", w, h);
+        mv_tex = NULL;
+        return 0;
+    }
+    ID3D12Resource_SetName(mv_tex, L"FH2DLSS MotionVectors");
+    ID3D12Device_CreateRenderTargetView(g_device, mv_tex, NULL, cpu_handle(rtv_heap, 0, rtv_inc));
+    mv_w = w;
+    mv_h = h;
+    log_msg("motion-vector texture %ux%u R16G16_FLOAT", w, h);
+    return 1;
+}
+
+static volatile LONG64 mv_seq;          /* motion-vector passes recorded */
+static LONG64 dlss_mv_seq;                /* the motion-vector pass the last DLSS dispatch used */
+
+static void record_mv_pass(ID3D12GraphicsCommandList *cl, ListState *s, ID3D12PipelineState *variant,
+                           UINT vc, UINT ic, UINT sv, UINT si) {
+    /* The game's pass is at half the render resolution. */
+    UINT w = (UINT)(s->vp[0].Width * 2.0f + 0.5f), h = (UINT)(s->vp[0].Height * 2.0f + 0.5f);
+    AcquireSRWLockExclusive(&mv_lock);
+    if (ensure_mv(w, h)) {
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = cpu_handle(rtv_heap, 0, rtv_inc);
+        D3D12_VIEWPORT vp = {0, 0, (float)w, (float)h, 0, 1};
+        D3D12_RECT sc = {0, 0, (LONG)w, (LONG)h};
+        transition(cl, mv_tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        real_SetPipelineState(cl, variant);
+        real_OMSetRenderTargets(cl, 1, &rtv, FALSE, NULL);
+        real_RSSetViewports(cl, 1, &vp);
+        real_RSSetScissorRects(cl, 1, &sc);
+        real_DrawInstanced(cl, vc, ic, sv, si);
+        transition(cl, mv_tex, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        /* Restore the game's state exactly as it set it. */
+        real_SetPipelineState(cl, s->pso);
+        real_OMSetRenderTargets(cl, s->num_rtv, s->num_rtv ? s->rtv : NULL, s->rtv_single,
+                                s->has_dsv ? &s->dsv : NULL);
+        apply_viewports(cl, s);
+        if (s->num_sc) {
+            real_RSSetScissorRects(cl, s->num_sc, s->sc);
+        }
+        InterlockedIncrement64(&mv_seq);
+        static int once;
+        if (!once) {
+            once = 1;
+            log_msg("first full-resolution motion-vector pass recorded (%ux%u)", w, h);
+        }
+    }
+    ReleaseSRWLockExclusive(&mv_lock);
+}
+
+static void record_mv_pass_indexed(ID3D12GraphicsCommandList *cl, ListState *s, ID3D12PipelineState *variant,
+                                   UINT index_count, UINT instance_count, UINT start_index,
+                                   INT base_vertex, UINT start_instance) {
+    /* Same full-resolution MV replay as record_mv_pass(), but preserve the indexed
+       draw form in case Azimuth 1.0.3 switches this pass between draw methods. */
+    UINT w = (UINT)(s->vp[0].Width * 2.0f + 0.5f), h = (UINT)(s->vp[0].Height * 2.0f + 0.5f);
+    AcquireSRWLockExclusive(&mv_lock);
+    if (ensure_mv(w, h)) {
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv = cpu_handle(rtv_heap, 0, rtv_inc);
+        D3D12_VIEWPORT vp = {0, 0, (float)w, (float)h, 0, 1};
+        D3D12_RECT sc = {0, 0, (LONG)w, (LONG)h};
+        transition(cl, mv_tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        real_SetPipelineState(cl, variant);
+        real_OMSetRenderTargets(cl, 1, &rtv, FALSE, NULL);
+        real_RSSetViewports(cl, 1, &vp);
+        real_RSSetScissorRects(cl, 1, &sc);
+        real_DrawIndexedInstanced(cl, index_count, instance_count, start_index, base_vertex, start_instance);
+        transition(cl, mv_tex, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        real_SetPipelineState(cl, s->pso);
+        real_OMSetRenderTargets(cl, s->num_rtv, s->num_rtv ? s->rtv : NULL, s->rtv_single,
+                                s->has_dsv ? &s->dsv : NULL);
+        apply_viewports(cl, s);
+        if (s->num_sc) {
+            real_RSSetScissorRects(cl, s->num_sc, s->sc);
+        }
+        InterlockedIncrement64(&mv_seq);
+        static int once;
+        if (!once) {
+            once = 1;
+            log_msg("motion-vector replay using indexed draw");
+        }
+    }
+    ReleaseSRWLockExclusive(&mv_lock);
+}
+
+static void note_scene_resources(ListState *s) {
+    if (!s->num_rtv || !s->has_dsv) {
+        return;
+    }
+    const ViewEntry *c = view_find(s->rtv[0].ptr), *d = view_find(s->dsv.ptr);
+    if (!c || !d || !c->resource || !d->resource) {
+        static int warned;
+        if (!warned++) {
+            log_msg("scene resolve: render-target/depth views not in the view map");
+        }
+        return;
+    }
+    if (c->resource != scene_color || d->resource != scene_depth) {
+        scene_color = c->resource;
+        scene_depth = d->resource;
+        static UINT logged_w, logged_h;
+        if (logged_w != c->width || logged_h != c->height) {
+            logged_w = c->width;
+            logged_h = c->height;
+            log_msg("scene resources captured at %ux%u", c->width, c->height);
+        }
+    }
+}
+
+static void run_dlss(ID3D12GraphicsCommandList *cl, ListState *s) {
+    LONG64 seq = mv_seq;
+    static LONG stale_resolves;
+    static LONG fallback_active;
+    int fallback = 0;
+
+    if (!dlss_enabled() || !scene_color || !scene_depth || !mv_tex) {
+        return;
+    }
+
+    if (seq == dlss_mv_seq) {
+        LONG n = InterlockedIncrement(&stale_resolves);
+        /* Pause and photo mode keep running the real scene resolve but FH2 stops the
+           motion-blur velocity pass that we replay for DLSS motion vectors.  Never
+           feed the old vectors back into DLSS.  After two consecutive resolves with
+           no fresh MV pass, switch to a history-reset fallback: zero vectors, no
+           temporal jitter, and a reset on every frame. */
+        if (n < 2) {
+            return;
+        }
+        fallback = 1;
+        if (!InterlockedExchange(&fallback_active, 1)) {
+            log_msg("DLSS pause/photo fallback active: no fresh MV pass; using zero motion vectors with history reset");
+        }
+    } else {
+        InterlockedExchange(&stale_resolves, 0);
+        if (InterlockedExchange(&fallback_active, 0)) {
+            log_msg("DLSS fresh motion vectors resumed; leaving pause/photo fallback");
+        }
+        dlss_mv_seq = seq;
+    }
+
+
+    /* DLSS records through the same (hooked) list methods, so keep the game's view of the list
+       and of the scene resources' states, and put both back afterwards. */
+    ListState saved = *s;
+    LONG color_state = scene_color_state, depth_state = scene_depth_state;
+    AcquireSRWLockShared(&mv_lock);
+
+    if (fallback) {
+        /* R16G16_FLOAT zero motion is valid for a disconnected/static frame.  Clear the
+           texture instead of reusing the last gameplay vectors. */
+        const FLOAT zero[4] = {0, 0, 0, 0};
+        D3D12_CPU_DESCRIPTOR_HANDLE mv_rtv = cpu_handle(rtv_heap, 0, rtv_inc);
+        transition(cl, mv_tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        ID3D12GraphicsCommandList_ClearRenderTargetView(cl, mv_rtv, zero, 0, NULL);
+        transition(cl, mv_tex, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        /* dlss_end_frame(0) below forces reset and keeps jitter disabled. */
+    }
+
+    int ok = dlss_run(cl, scene_color, (D3D12_RESOURCE_STATES)color_state, scene_depth,
+                     (D3D12_RESOURCE_STATES)depth_state, mv_tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    ReleaseSRWLockShared(&mv_lock);
+    InterlockedExchange(&scene_color_state, color_state);
+    InterlockedExchange(&scene_depth_state, depth_state);
+    *s = saved;
+    restore_after_dlss(cl, s);
+
+    /* In normal gameplay, a successful DLAA evaluation enables next-frame jitter.
+       Fallback frames deliberately remain disconnected from history: dlss_end_frame(0)
+       keeps reset asserted and suppresses camera jitter until fresh MVs return. */
+    dlss_end_frame((!fallback && ok) ? 1 : 0);
+}
+
+/* Resolve dispatch is deliberately hash-specific on Azimuth 1.0.3.
+   The previous structural R11G11B10+D32 fallback also matched unrelated/depth-only passes. */
+
+static void STDMETHODCALLTYPE hook_DrawInstanced(ID3D12GraphicsCommandList *cl, UINT vc, UINT ic, UINT sv, UINT si) {
+    ListState *s = state_for(cl);
+    ID3D12PipelineState *variant = NULL;
+    int role = s ? pso_lookup(s->pso, &variant) : ROLE_NONE;
+    if (role == ROLE_RESOLVE) {
+        note_scene_resources(s);
+        real_DrawInstanced(cl, vc, ic, sv, si);
+        run_dlss(cl, s);
+        return;
+    } else if (role == ROLE_MV && variant && s->num_vp) {
+        record_mv_pass(cl, s, variant, vc, ic, sv, si);
+    }
+    real_DrawInstanced(cl, vc, ic, sv, si);
+}
+
+static void STDMETHODCALLTYPE hook_DrawIndexedInstanced(ID3D12GraphicsCommandList *cl, UINT index_count,
+                                                        UINT instance_count, UINT start_index,
+                                                        INT base_vertex, UINT start_instance) {
+    ListState *s = state_for(cl);
+    ID3D12PipelineState *variant = NULL;
+    int role = s ? pso_lookup(s->pso, &variant) : ROLE_NONE;
+    if (role == ROLE_RESOLVE) {
+        note_scene_resources(s);
+    } else if (role == ROLE_MV && variant && s->num_vp) {
+        record_mv_pass_indexed(cl, s, variant, index_count, instance_count, start_index, base_vertex, start_instance);
+    }
+    real_DrawIndexedInstanced(cl, index_count, instance_count, start_index, base_vertex, start_instance);
+}
+
+/* ---------------------------------------------------------------- device hooks */
+
+static void hook_command_list(ID3D12GraphicsCommandList *cl) {
+    patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, Reset), (void *)hook_Reset, (void **)&real_Reset);
+    patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, SetPipelineState), (void *)hook_SetPipelineState, (void **)&real_SetPipelineState);
+    patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, OMSetRenderTargets), (void *)hook_OMSetRenderTargets, (void **)&real_OMSetRenderTargets);
+    patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, RSSetViewports), (void *)hook_RSSetViewports, (void **)&real_RSSetViewports);
+    patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, RSSetScissorRects), (void *)hook_RSSetScissorRects, (void **)&real_RSSetScissorRects);
+    patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, DrawInstanced), (void *)hook_DrawInstanced, (void **)&real_DrawInstanced);
+    patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, DrawIndexedInstanced), (void *)hook_DrawIndexedInstanced, (void **)&real_DrawIndexedInstanced);
+    patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, ResourceBarrier), (void *)hook_ResourceBarrier, (void **)&real_ResourceBarrier);
+    patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, SetDescriptorHeaps), (void *)hook_SetDescriptorHeaps, (void **)&real_SetDescriptorHeaps);
+    patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, SetComputeRootSignature), (void *)hook_SetComputeRootSignature, (void **)&real_SetComputeRootSignature);
+    patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, SetGraphicsRootSignature), (void *)hook_SetGraphicsRootSignature, (void **)&real_SetGraphicsRootSignature);
+    patch_slot(VT_SLOT(cl, ID3D12GraphicsCommandListVtbl, SetGraphicsRootDescriptorTable), (void *)hook_SetGraphicsRootDescriptorTable, (void **)&real_SetGraphicsRootDescriptorTable);
+}
+
+static HRESULT STDMETHODCALLTYPE hook_CreateCommandList(ID3D12Device *dev, UINT mask, D3D12_COMMAND_LIST_TYPE type,
+                                                        ID3D12CommandAllocator *alloc, ID3D12PipelineState *pso,
+                                                        REFIID riid, void **out) {
+    HRESULT hr = real_CreateCommandList(dev, mask, type, alloc, pso, riid, out);
+    if (SUCCEEDED(hr) && out && *out && type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        ID3D12GraphicsCommandList *cl = NULL;
+        if (SUCCEEDED(IUnknown_QueryInterface((IUnknown *)*out, &IID_ID3D12GraphicsCommandList, (void **)&cl))) {
+            hook_command_list(cl);
+            ListState *s = state_for(cl);
+            if (s) {
+                s->pso = pso;
+            }
+            ID3D12GraphicsCommandList_Release(cl);
+        }
+    }
+    return hr;
+}
+
+static HRESULT WINAPI hook_D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL fl, REFIID riid, void **out) {
+    HRESULT hr = real_D3D12CreateDevice(adapter, fl, riid, out);
+    if (SUCCEEDED(hr) && out && *out && !g_device) {
+        ID3D12Device *dev = NULL;
+        if (SUCCEEDED(IUnknown_QueryInterface((IUnknown *)*out, &IID_ID3D12Device, (void **)&dev))) {
+            g_device = dev; /* keep the reference for the process lifetime */
+            patch_slot(VT_SLOT(dev, ID3D12DeviceVtbl, CreateGraphicsPipelineState), (void *)hook_CreateGraphicsPipelineState, (void **)&real_CreateGraphicsPipelineState);
+            patch_slot(VT_SLOT(dev, ID3D12DeviceVtbl, CreateCommandList), (void *)hook_CreateCommandList, (void **)&real_CreateCommandList);
+            patch_slot(VT_SLOT(dev, ID3D12DeviceVtbl, CreateRenderTargetView), (void *)hook_CreateRenderTargetView, (void **)&real_CreateRenderTargetView);
+            patch_slot(VT_SLOT(dev, ID3D12DeviceVtbl, CreateDepthStencilView), (void *)hook_CreateDepthStencilView, (void **)&real_CreateDepthStencilView);
+            patch_slot(VT_SLOT(dev, ID3D12Device1Vtbl, CreatePipelineLibrary), (void *)hook_CreatePipelineLibrary, (void **)&real_CreatePipelineLibrary);
+            dlss_init(dev);
+            log_msg("D3D12 device hooked");
+        }
+    }
+    return hr;
+}
+
+/* ---------------------------------------------------------------- hotkey */
+
+static void poll_f11(void) {
+    static SHORT last;
+    SHORT now = GetAsyncKeyState(VK_F11) & 0x8000;
+    HWND fg = GetForegroundWindow();
+    DWORD pid = 0;
+    if (fg) {
+        GetWindowThreadProcessId(fg, &pid);
+    }
+    if (pid != GetCurrentProcessId()) {
+        last = now;
+        return;
+    }
+    if (now && !last) {
+        dlss_toggle();
+    }
+    last = now;
+}
+
+static volatile LONG hotkey_thread_started;
+
+static DWORD WINAPI hotkey_thread_main(LPVOID unused) {
+    (void)unused;
+    for (;;) {
+        poll_f11();
+        Sleep(10);
+    }
+}
+
+static void ensure_hotkey_thread(void) {
+    if (InterlockedCompareExchange(&hotkey_thread_started, 1, 0) != 0) {
+        return;
+    }
+    HANDLE thread = CreateThread(NULL, 0, hotkey_thread_main, NULL, 0, NULL);
+    if (!thread) {
+        InterlockedExchange(&hotkey_thread_started, 0);
+        log_msg("F11 hotkey thread failed to start (error %lu)", GetLastError());
+        return;
+    }
+    CloseHandle(thread);
+}
+
+static void before_present(IDXGISwapChain *sc) {
+    (void)sc;
+    /* Do not drive DLSS temporal state from Present. Azimuth 1.0.3 owns multiple
+       swap chains and their Presents are not a reliable scene-frame boundary.
+       run_dlss() now updates jitter_live directly from the DLAA evaluation result. */
+
+    InterlockedIncrement64(&present_count);
+    AcquireSRWLockExclusive(&mv_lock);
+    for (int i = 0; i < 16; ++i) {
+        if (retired[i] && present_count - retired_at[i] > 8) {
+            ID3D12Resource_Release(retired[i]);
+            retired[i] = NULL;
+        }
+    }
+    ReleaseSRWLockExclusive(&mv_lock);
+}
+
+/* ---------------------------------------------------------------- swap chain */
+
+static HRESULT STDMETHODCALLTYPE hook_Present(IDXGISwapChain *sc, UINT sync, UINT flags) {
+    if (!(flags & DXGI_PRESENT_TEST)) {
+        before_present(sc);
+    }
+    return real_Present(sc, sync, flags);
+}
+
+static HRESULT STDMETHODCALLTYPE hook_Present1(IDXGISwapChain1 *sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS *p) {
+    if (!(flags & DXGI_PRESENT_TEST)) {
+        before_present((IDXGISwapChain *)sc);
+    }
+    return real_Present1(sc, sync, flags, p);
+}
+
+static HRESULT STDMETHODCALLTYPE hook_CreateSwapChainForHwnd(IDXGIFactory2 *f, IUnknown *device, HWND hwnd,
+                                                             const DXGI_SWAP_CHAIN_DESC1 *desc,
+                                                             const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fs,
+                                                             IDXGIOutput *out, IDXGISwapChain1 **sc) {
+    HRESULT hr = real_CreateSwapChainForHwnd(f, device, hwnd, desc, fs, out, sc);
+    if (SUCCEEDED(hr) && sc && *sc) {
+        patch_slot(VT_SLOT(*sc, IDXGISwapChain1Vtbl, Present), (void *)hook_Present, (void **)&real_Present);
+        patch_slot(VT_SLOT(*sc, IDXGISwapChain1Vtbl, Present1), (void *)hook_Present1, (void **)&real_Present1);
+        ensure_hotkey_thread();
+        log_msg("swap chain %ux%u format %d hooked", desc->Width, desc->Height, (int)desc->Format);
+    }
+    return hr;
+}
+
+static void hook_factory(void *factory) {
+    IDXGIFactory2 *f2 = NULL;
+    if (factory && SUCCEEDED(IUnknown_QueryInterface((IUnknown *)factory, &IID_IDXGIFactory2, (void **)&f2))) {
+        patch_slot(VT_SLOT(f2, IDXGIFactory2Vtbl, CreateSwapChainForHwnd), (void *)hook_CreateSwapChainForHwnd, (void **)&real_CreateSwapChainForHwnd);
+        IDXGIFactory2_Release(f2);
+    }
+}
+
+#define RESOLVE(var, name)                                                                   \
+    if (!var) {                                                                              \
+        HMODULE m = proxy_system_dxgi();                                                     \
+        *(FARPROC *)&var = m ? GetProcAddress(m, name) : NULL;                               \
+    }
+
+HRESULT WINAPI CreateDXGIFactory(REFIID riid, void **out) {
+    RESOLVE(real_CreateDXGIFactory, "CreateDXGIFactory");
+    HRESULT hr = real_CreateDXGIFactory ? real_CreateDXGIFactory(riid, out) : E_FAIL;
+    if (SUCCEEDED(hr)) {
+        hook_factory(*out);
+    }
+    return hr;
+}
+
+HRESULT WINAPI CreateDXGIFactory1(REFIID riid, void **out) {
+    RESOLVE(real_CreateDXGIFactory1, "CreateDXGIFactory1");
+    HRESULT hr = real_CreateDXGIFactory1 ? real_CreateDXGIFactory1(riid, out) : E_FAIL;
+    if (SUCCEEDED(hr)) {
+        hook_factory(*out);
+    }
+    return hr;
+}
+
+HRESULT WINAPI CreateDXGIFactory2(UINT flags, REFIID riid, void **out) {
+    RESOLVE(real_CreateDXGIFactory2, "CreateDXGIFactory2");
+    HRESULT hr = real_CreateDXGIFactory2 ? real_CreateDXGIFactory2(flags, riid, out) : E_FAIL;
+    if (SUCCEEDED(hr)) {
+        hook_factory(*out);
+    }
+    return hr;
+}
+
+/* ---------------------------------------------------------------- import patch */
+
+static int patch_exe_import(void) {
+    BYTE *base = (BYTE *)GetModuleHandleW(NULL);
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
+    IMAGE_DATA_DIRECTORY dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress) {
+        return 0;
+    }
+    for (IMAGE_IMPORT_DESCRIPTOR *d = (IMAGE_IMPORT_DESCRIPTOR *)(base + dir.VirtualAddress); d->Name; ++d) {
+        if (lstrcmpiA((const char *)(base + d->Name), "d3d12.dll")) {
+            continue;
+        }
+        IMAGE_THUNK_DATA *names = (IMAGE_THUNK_DATA *)(base + (d->OriginalFirstThunk ? d->OriginalFirstThunk : d->FirstThunk));
+        IMAGE_THUNK_DATA *iat = (IMAGE_THUNK_DATA *)(base + d->FirstThunk);
+        for (; names->u1.AddressOfData; ++names, ++iat) {
+            int match;
+            if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) {
+                match = IMAGE_ORDINAL(names->u1.Ordinal) == 101;
+            } else {
+                IMAGE_IMPORT_BY_NAME *ibn = (IMAGE_IMPORT_BY_NAME *)(base + names->u1.AddressOfData);
+                match = !strcmp((const char *)ibn->Name, "D3D12CreateDevice");
+            }
+            if (match) {
+                patch_slot((void **)&iat->u1.Function, (void *)hook_D3D12CreateDevice, (void **)&real_D3D12CreateDevice);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
+    (void)reserved;
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(inst);
+        InitializeCriticalSection(&log_lock);
+        wchar_t path[MAX_PATH];
+        DWORD n = GetModuleFileNameW(inst, path, MAX_PATH);
+        while (n && path[n - 1] != L'\\') {
+            --n;
+        }
+        lstrcpyW(path + n, L"fh2_dlss.log");
+        log_file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        log_msg("FH2 NVIDIA DLAA public test for Azimuth 1.0.3. F11: DLAA on/off");
+        log_msg(patch_exe_import() ? "D3D12CreateDevice import patched" : "D3D12CreateDevice import NOT found");
+    }
+    return TRUE;
+}
