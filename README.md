@@ -1,6 +1,6 @@
 # Azimuth-DLAA
 
-NVIDIA DLAA support for games running through [Azimuth](https://almost-there-games.itch.io/azimuth).
+NVIDIA DLAA support for Forza games running through [Azimuth](https://almost-there-games.itch.io/azimuth).
 
 Azimuth-DLAA uses one shared D3D12/NGX core and small per-game render profiles. The current build automatically detects the supported game from its known render-pass shaders; users do not need separate FH2 and FH3 DLLs.
 
