@@ -1,7 +1,7 @@
 /* NVIDIA DLAA (DLSS Super Resolution at 1:1, no upscaling) through NVIDIA NGX.
 
    The NGX static library is built with MSVC and cannot be linked into this MinGW/Zig-built
-   dxgi.dll, so all NGX calls live in a small separate DLL (fh2_ngx.dll, see bridge/) that is
+   dxgi.dll, so all NGX calls live in a small separate DLL (azimuth_ngx.dll, see bridge/) that is
    loaded here at runtime. nvngx_dlss.dll (NVIDIA) must sit next to azimuth.exe as well.
 
    This file keeps the exact same job (and the same internal API) the FSR backend had:
@@ -12,7 +12,7 @@
 #include <stdbool.h>
 #include <string.h>
 
-/* Exports of fh2_ngx.dll. */
+/* Exports of azimuth_ngx.dll. */
 typedef int (*PfnNgxInit)(ID3D12Device *dev, const wchar_t *dir, int *ngx_result);
 typedef int (*PfnNgxEvaluate)(ID3D12GraphicsCommandList *cl, ID3D12Resource *color, ID3D12Resource *depth,
                               ID3D12Resource *mv, ID3D12Resource *out, unsigned w, unsigned h, float jx, float jy,
@@ -70,17 +70,17 @@ static int load(void) {
         return 0;
     }
     lstrcpyW(path, dir);
-    lstrcatW(path, L"fh2_ngx.dll");
+    lstrcatW(path, L"azimuth_ngx.dll");
     HMODULE m = LoadLibraryExW(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!m) {
-        log_msg("DLSS: fh2_ngx.dll not found next to azimuth.exe (error %lu)", GetLastError());
+        log_msg("DLSS: azimuth_ngx.dll not found next to azimuth.exe (error %lu)", GetLastError());
         return 0;
     }
-    *(FARPROC *)&p_init = GetProcAddress(m, "fh2ngx_init");
-    *(FARPROC *)&p_evaluate = GetProcAddress(m, "fh2ngx_evaluate");
-    *(FARPROC *)&p_result_string = GetProcAddress(m, "fh2ngx_result_string");
+    *(FARPROC *)&p_init = GetProcAddress(m, "azngx_init");
+    *(FARPROC *)&p_evaluate = GetProcAddress(m, "azngx_evaluate");
+    *(FARPROC *)&p_result_string = GetProcAddress(m, "azngx_result_string");
     if (!p_init || !p_evaluate || !p_result_string) {
-        log_msg("DLSS: fh2_ngx.dll exports missing");
+        log_msg("DLSS: azimuth_ngx.dll exports missing");
         p_evaluate = NULL;
         return 0;
     }
@@ -177,7 +177,7 @@ static int ensure_ready(UINT w, UINT h) {
         out_failed = 1;
         return 0;
     }
-    ID3D12Resource_SetName(out_tex, L"FH2DLSS Output");
+    ID3D12Resource_SetName(out_tex, L"AzimuthDLAA Output");
     ctx_w = w;
     ctx_h = h;
     need_reset = 1;

@@ -1,5 +1,5 @@
 @echo off
-REM Builds fh2_ngx.dll with MSVC. Run from an "x64 Native Tools Command Prompt for VS".
+REM Builds azimuth_ngx.dll with MSVC. Run from an "x64 Native Tools Command Prompt for VS".
 REM Needs NVIDIA's DLSS SDK (https://github.com/NVIDIA/DLSS), cloned to ..\third_party\DLSS
 REM or pointed to with:  set DLSS_SDK=C:\path\to\DLSS
 setlocal
@@ -20,7 +20,7 @@ if not exist "%LIBDIR%\%NGXLIB%" (
 )
 if not exist "%~dp0..\build" mkdir "%~dp0..\build"
 cl /nologo /O2 /EHsc %CRT% /LD /I"%DLSS_SDK%\include" ngx_bridge.cpp ^
-   /Fo"%~dp0..\build\\" /Fe"%~dp0..\build\fh2_ngx.dll" ^
+   /Fo"%~dp0..\build\\" /Fe"%~dp0..\build\azimuth_ngx.dll" ^
    /link /LIBPATH:"%LIBDIR%" %NGXLIB% d3d12.lib user32.lib advapi32.lib
 if errorlevel 1 exit /b 1
-echo built build\fh2_ngx.dll
+echo built build\azimuth_ngx.dll

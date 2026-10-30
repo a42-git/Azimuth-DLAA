@@ -1,4 +1,4 @@
-/* FH2 DLAA: NVIDIA DLAA (DLSS) for Azimuth (jitter and full-resolution motion vectors).
+/* Azimuth-DLAA: one D3D12/DLAA core with per-game render profiles.
    Loaded as dxgi.dll next to azimuth.exe. Hooks D3D12CreateDevice through the exe's
    import table, then device / command-list / factory / swap-chain vtables. */
 #define COBJMACROS
@@ -11,7 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "shaders.h"
+#include "game_profile.h"
 #include "common.h"
 
 HMODULE proxy_system_dxgi(void);
@@ -61,12 +61,6 @@ static void patch_slot(void **slot, void *hook, void **original) {
 #define VT_SLOT(obj, Vtbl, Method) ((void **)&((Vtbl *)(*(void **)(obj)))->Method)
 
 /* ---------------------------------------------------------------- globals */
-
-/* DXBC checksums of the Azimuth 1.0.3 FH2 passes used by the stable path. */
-static const DWORD MV_PS_HASH[4] = {0x8a12870f, 0x60f7c6e9, 0x21d28459, 0x07b63a84};
-static const DWORD RESOLVE_PS_HASH[4] = {0x1549a8f9, 0xd8526d4b, 0x60608dd5, 0x6ae7bb32};
-
-enum { ROLE_NONE, ROLE_MV, ROLE_RESOLVE };
 
 typedef HRESULT(WINAPI *PFN_Compile)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO *,
                                      ID3DInclude *, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob **,
@@ -160,23 +154,13 @@ static ID3DBlob *compile(const char *src, const char *entry, const char *target)
     return SUCCEEDED(hr) ? code : NULL;
 }
 
-static int shader_role(const D3D12_SHADER_BYTECODE *ps) {
-    if (!ps->pShaderBytecode || ps->BytecodeLength < 20) {
-        return ROLE_NONE;
+static const GameProfile *profile_for_shader(const D3D12_SHADER_BYTECODE *ps, int *role) {
+    const GameProfile *profile = game_profile_match(ps, role);
+    static LONG profile_logged;
+    if (profile && !InterlockedExchange(&profile_logged, 1)) {
+        log_msg("game profile detected: %s (tested with Azimuth %s)", profile->name, profile->tested_azimuth);
     }
-    const BYTE *b = ps->pShaderBytecode;
-    if (memcmp(b, "DXBC", 4)) {
-        return ROLE_NONE;
-    }
-    DWORD h[4];
-    memcpy(h, b + 4, 16);
-    if (!memcmp(h, MV_PS_HASH, 16)) {
-        return ROLE_MV;
-    }
-    if (!memcmp(h, RESOLVE_PS_HASH, 16)) {
-        return ROLE_RESOLVE;
-    }
-    return ROLE_NONE;
+    return profile;
 }
 
 /* ---------------------------------------------------------------- PSO hook */
@@ -201,27 +185,33 @@ static void remember_pso(ID3D12PipelineState *pso, ID3D12PipelineState *variant,
     }
 }
 
-/* Records the game passes we key on; builds our full-resolution variant of the motion-vector pass. */
+/* Records the selected game's exact passes and builds its full-resolution MV variant. */
 static void consider_pso(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, ID3D12PipelineState *pso) {
     if (!desc || !pso || !g_device) {
         return;
     }
-    int role = shader_role(&desc->PS);
-    if (role == ROLE_NONE || pso_known(pso)) {
+
+    int role = ROLE_NONE;
+    const GameProfile *profile = profile_for_shader(&desc->PS, &role);
+    if (!profile || role == ROLE_NONE || pso_known(pso)) {
         return;
     }
+
     if (role == ROLE_RESOLVE) {
         remember_pso(pso, NULL, role);
         static LONG logged_resolve;
         if (!InterlockedExchange(&logged_resolve, 1)) {
-            log_msg("scene resolve pass found");
+            log_msg("%s scene resolve pass found", profile->name);
         }
         return;
     }
-    ID3DBlob *ps = compile(MV_PS_HLSL, "main", "ps_5_0");
+
+    ID3DBlob *ps = compile(profile->mv_ps_hlsl, "main", "ps_5_0");
     if (!ps) {
+        log_msg("%s motion-vector replacement shader compilation failed", profile->name);
         return;
     }
+
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = *desc;
     d.PS.pShaderBytecode = ID3D10Blob_GetBufferPointer(ps);
     d.PS.BytecodeLength = ID3D10Blob_GetBufferSize(ps);
@@ -240,17 +230,19 @@ static void consider_pso(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, ID3D12P
     d.SampleMask = UINT_MAX;
     d.CachedPSO.pCachedBlob = NULL;
     d.CachedPSO.CachedBlobSizeInBytes = 0;
+
     ID3D12PipelineState *variant = NULL;
     HRESULT vhr = real_CreateGraphicsPipelineState(g_device, &d, &IID_ID3D12PipelineState, (void **)&variant);
     ID3D10Blob_Release(ps);
-    if (FAILED(vhr)) {
-        log_msg("motion-vector variant PSO failed 0x%08lx", vhr);
+    if (FAILED(vhr) || !variant) {
+        log_msg("%s motion-vector variant PSO failed 0x%08lx", profile->name, vhr);
         return;
     }
+
     remember_pso(pso, variant, ROLE_MV);
     static LONG logged_mv;
     if (!InterlockedExchange(&logged_mv, 1)) {
-        log_msg("motion-vector pass found; full-resolution variant ready");
+        log_msg("%s motion-vector pass found; full-resolution replay variant ready", profile->name);
     }
 }
 
@@ -447,14 +439,17 @@ static void STDMETHODCALLTYPE hook_CreateDepthStencilView(ID3D12Device *dev, ID3
 
 /* The scene depth buffer: depth+stencil at the scene colour's size (found at the resolve). */
 static BOOL is_scene_dsv(D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    const GameProfile *profile = game_profile_active();
     const ViewEntry *e = view_find(h.ptr);
-    if (!e || !scene_color) {
+    if (!profile || !e || !scene_color) {
         return FALSE;
     }
-    BOOL depth_stencil = e->format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT || e->format == DXGI_FORMAT_R32G8X24_TYPELESS;
+    if (!game_profile_is_jitter_depth(profile, e->format)) {
+        return FALSE;
+    }
     D3D12_RESOURCE_DESC d;
     scene_color->lpVtbl->GetDesc(scene_color, &d);
-    return depth_stencil && e->width == d.Width && e->height == d.Height;
+    return e->width == d.Width && e->height == d.Height;
 }
 
 /* ---------------------------------------------------------------- list hooks */
@@ -696,7 +691,7 @@ static int ensure_mv(UINT w, UINT h) {
         mv_tex = NULL;
         return 0;
     }
-    ID3D12Resource_SetName(mv_tex, L"FH2DLSS MotionVectors");
+    ID3D12Resource_SetName(mv_tex, L"AzimuthDLAA MotionVectors");
     ID3D12Device_CreateRenderTargetView(g_device, mv_tex, NULL, cpu_handle(rtv_heap, 0, rtv_inc));
     mv_w = w;
     mv_h = h;
@@ -709,8 +704,12 @@ static LONG64 dlss_mv_seq;                /* the motion-vector pass the last DLS
 
 static void record_mv_pass(ID3D12GraphicsCommandList *cl, ListState *s, ID3D12PipelineState *variant,
                            UINT vc, UINT ic, UINT sv, UINT si) {
-    /* The game's pass is at half the render resolution. */
-    UINT w = (UINT)(s->vp[0].Width * 2.0f + 0.5f), h = (UINT)(s->vp[0].Height * 2.0f + 0.5f);
+    const GameProfile *profile = game_profile_active();
+    if (!profile) {
+        return;
+    }
+    UINT w = (UINT)(s->vp[0].Width * profile->mv_resolution_scale + 0.5f);
+    UINT h = (UINT)(s->vp[0].Height * profile->mv_resolution_scale + 0.5f);
     AcquireSRWLockExclusive(&mv_lock);
     if (ensure_mv(w, h)) {
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = cpu_handle(rtv_heap, 0, rtv_inc);
@@ -744,9 +743,12 @@ static void record_mv_pass(ID3D12GraphicsCommandList *cl, ListState *s, ID3D12Pi
 static void record_mv_pass_indexed(ID3D12GraphicsCommandList *cl, ListState *s, ID3D12PipelineState *variant,
                                    UINT index_count, UINT instance_count, UINT start_index,
                                    INT base_vertex, UINT start_instance) {
-    /* Same full-resolution MV replay as record_mv_pass(), but preserve the indexed
-       draw form in case Azimuth 1.0.3 switches this pass between draw methods. */
-    UINT w = (UINT)(s->vp[0].Width * 2.0f + 0.5f), h = (UINT)(s->vp[0].Height * 2.0f + 0.5f);
+    const GameProfile *profile = game_profile_active();
+    if (!profile) {
+        return;
+    }
+    UINT w = (UINT)(s->vp[0].Width * profile->mv_resolution_scale + 0.5f);
+    UINT h = (UINT)(s->vp[0].Height * profile->mv_resolution_scale + 0.5f);
     AcquireSRWLockExclusive(&mv_lock);
     if (ensure_mv(w, h)) {
         D3D12_CPU_DESCRIPTOR_HANDLE rtv = cpu_handle(rtv_heap, 0, rtv_inc);
@@ -776,9 +778,10 @@ static void record_mv_pass_indexed(ID3D12GraphicsCommandList *cl, ListState *s, 
     ReleaseSRWLockExclusive(&mv_lock);
 }
 
-static void note_scene_resources(ListState *s) {
-    if (!s->num_rtv || !s->has_dsv) {
-        return;
+static BOOL note_scene_resources(ListState *s) {
+    const GameProfile *profile = game_profile_active();
+    if (!profile || !s->num_rtv || !s->has_dsv) {
+        return FALSE;
     }
     const ViewEntry *c = view_find(s->rtv[0].ptr), *d = view_find(s->dsv.ptr);
     if (!c || !d || !c->resource || !d->resource) {
@@ -786,18 +789,33 @@ static void note_scene_resources(ListState *s) {
         if (!warned++) {
             log_msg("scene resolve: render-target/depth views not in the view map");
         }
-        return;
+        return FALSE;
+    }
+    if ((profile->resolve_rtv_format != DXGI_FORMAT_UNKNOWN && c->format != profile->resolve_rtv_format) ||
+        (profile->resolve_dsv_format != DXGI_FORMAT_UNKNOWN && d->format != profile->resolve_dsv_format)) {
+        static LONG format_warned;
+        if (!InterlockedExchange(&format_warned, 1)) {
+            log_msg("%s resolve format mismatch: color=%d expected=%d depth=%d expected=%d; DLAA capture skipped",
+                    profile->name, (int)c->format, (int)profile->resolve_rtv_format,
+                    (int)d->format, (int)profile->resolve_dsv_format);
+        }
+        return FALSE;
     }
     if (c->resource != scene_color || d->resource != scene_depth) {
         scene_color = c->resource;
         scene_depth = d->resource;
+        if (profile->capture_sets_write_states) {
+            InterlockedExchange(&scene_color_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            InterlockedExchange(&scene_depth_state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        }
         static UINT logged_w, logged_h;
         if (logged_w != c->width || logged_h != c->height) {
             logged_w = c->width;
             logged_h = c->height;
-            log_msg("scene resources captured at %ux%u", c->width, c->height);
+            log_msg("%s scene resources captured at %ux%u", profile->name, c->width, c->height);
         }
     }
+    return TRUE;
 }
 
 static void run_dlss(ID3D12GraphicsCommandList *cl, ListState *s) {
@@ -812,9 +830,8 @@ static void run_dlss(ID3D12GraphicsCommandList *cl, ListState *s) {
 
     if (seq == dlss_mv_seq) {
         LONG n = InterlockedIncrement(&stale_resolves);
-        /* Pause and photo mode keep running the real scene resolve but FH2 stops the
-           motion-blur velocity pass that we replay for DLSS motion vectors.  Never
-           feed the old vectors back into DLSS.  After two consecutive resolves with
+        /* Some game states keep running the scene resolve while the velocity pass stops.
+           Never feed stale vectors back into DLSS. After two consecutive resolves with
            no fresh MV pass, switch to a history-reset fallback: zero vectors, no
            temporal jitter, and a reset on every frame. */
         if (n < 2) {
@@ -864,19 +881,20 @@ static void run_dlss(ID3D12GraphicsCommandList *cl, ListState *s) {
     dlss_end_frame((!fallback && ok) ? 1 : 0);
 }
 
-/* Resolve dispatch is deliberately hash-specific on Azimuth 1.0.3.
-   The previous structural R11G11B10+D32 fallback also matched unrelated/depth-only passes. */
+/* Resolve dispatch is exact-hash-specific inside the active game profile. */
 
 static void STDMETHODCALLTYPE hook_DrawInstanced(ID3D12GraphicsCommandList *cl, UINT vc, UINT ic, UINT sv, UINT si) {
     ListState *s = state_for(cl);
     ID3D12PipelineState *variant = NULL;
     int role = s ? pso_lookup(s->pso, &variant) : ROLE_NONE;
-    if (role == ROLE_RESOLVE) {
-        note_scene_resources(s);
+    if (role == ROLE_RESOLVE && s) {
+        BOOL scene_ok = note_scene_resources(s);
         real_DrawInstanced(cl, vc, ic, sv, si);
-        run_dlss(cl, s);
+        if (scene_ok) {
+            run_dlss(cl, s);
+        }
         return;
-    } else if (role == ROLE_MV && variant && s->num_vp) {
+    } else if (role == ROLE_MV && variant && s && s->num_vp) {
         record_mv_pass(cl, s, variant, vc, ic, sv, si);
     }
     real_DrawInstanced(cl, vc, ic, sv, si);
@@ -888,9 +906,17 @@ static void STDMETHODCALLTYPE hook_DrawIndexedInstanced(ID3D12GraphicsCommandLis
     ListState *s = state_for(cl);
     ID3D12PipelineState *variant = NULL;
     int role = s ? pso_lookup(s->pso, &variant) : ROLE_NONE;
-    if (role == ROLE_RESOLVE) {
-        note_scene_resources(s);
-    } else if (role == ROLE_MV && variant && s->num_vp) {
+    if (role == ROLE_RESOLVE && s) {
+        const GameProfile *profile = game_profile_active();
+        BOOL scene_ok = note_scene_resources(s);
+        if (profile && profile->dispatch_indexed_resolve) {
+            real_DrawIndexedInstanced(cl, index_count, instance_count, start_index, base_vertex, start_instance);
+            if (scene_ok) {
+                run_dlss(cl, s);
+            }
+            return;
+        }
+    } else if (role == ROLE_MV && variant && s && s->num_vp) {
         record_mv_pass_indexed(cl, s, variant, index_count, instance_count, start_index, base_vertex, start_instance);
     }
     real_DrawIndexedInstanced(cl, index_count, instance_count, start_index, base_vertex, start_instance);
@@ -994,7 +1020,7 @@ static void ensure_hotkey_thread(void) {
 
 static void before_present(IDXGISwapChain *sc) {
     (void)sc;
-    /* Do not drive DLSS temporal state from Present. Azimuth 1.0.3 owns multiple
+    /* Do not drive DLSS temporal state from Present. Azimuth may own multiple
        swap chains and their Presents are not a reliable scene-frame boundary.
        run_dlss() now updates jitter_live directly from the DLAA evaluation result. */
 
@@ -1122,9 +1148,9 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
         while (n && path[n - 1] != L'\\') {
             --n;
         }
-        lstrcpyW(path + n, L"fh2_dlss.log");
+        lstrcpyW(path + n, L"azimuth_dlaa.log");
         log_file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        log_msg("FH2 NVIDIA DLAA public test for Azimuth 1.0.3. F11: DLAA on/off");
+        log_msg("Azimuth-DLAA unified build. Supported profiles: FH2, FH3. F11: DLAA on/off");
         log_msg(patch_exe_import() ? "D3D12CreateDevice import patched" : "D3D12CreateDevice import NOT found");
     }
     return TRUE;

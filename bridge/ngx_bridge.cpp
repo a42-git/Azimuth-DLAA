@@ -1,4 +1,5 @@
-// fh2_ngx.dll - the NVIDIA NGX (DLSS) half of FH2-DLAA.
+// azimuth_ngx.dll - the NVIDIA NGX/DLSS bridge used by Azimuth-DLAA.
+// Game-specific rendering logic stays in dxgi.dll; this DLL only owns NGX calls.
 //
 // NVIDIA's nvsdk_ngx_*.lib is an MSVC static library, so it can't be linked into the
 // Zig/MinGW-built dxgi.dll. This tiny DLL is built with MSVC instead and exposes a plain C
@@ -38,7 +39,7 @@ static void release_retired(bool force) {
     }
 }
 
-EXPORT const char *fh2ngx_result_string(int result) {
+EXPORT const char *azngx_result_string(int result) {
     static char buf[160];
     const wchar_t *w = GetNGXResultAsString((NVSDK_NGX_Result)result);
     if (!w || !WideCharToMultiByte(CP_UTF8, 0, w, -1, buf, sizeof(buf), nullptr, nullptr)) {
@@ -49,7 +50,7 @@ EXPORT const char *fh2ngx_result_string(int result) {
 
 // Returns 1 when DLSS Super Resolution is usable. `dir` is the folder holding nvngx_dlss.dll
 // (the Azimuth folder); NGX also uses it as its data/log path.
-EXPORT int fh2ngx_init(ID3D12Device *device, const wchar_t *dir, int *ngx_result) {
+EXPORT int azngx_init(ID3D12Device *device, const wchar_t *dir, int *ngx_result) {
     if (g_ready) {
         return 1;
     }
@@ -86,7 +87,7 @@ EXPORT int fh2ngx_init(ID3D12Device *device, const wchar_t *dir, int *ngx_result
 
 // Runs DLAA: colour -> out, all at the same size. Feature creation is recorded into the same
 // command list on first use and whenever the size changes.
-EXPORT int fh2ngx_evaluate(ID3D12GraphicsCommandList *cl, ID3D12Resource *color, ID3D12Resource *depth,
+EXPORT int azngx_evaluate(ID3D12GraphicsCommandList *cl, ID3D12Resource *color, ID3D12Resource *depth,
                            ID3D12Resource *mv, ID3D12Resource *out, unsigned w, unsigned h, float jx, float jy,
                            float mv_scale_x, float mv_scale_y, int reset, int *ngx_result) {
     if (!g_ready) {
@@ -145,7 +146,7 @@ EXPORT int fh2ngx_evaluate(ID3D12GraphicsCommandList *cl, ID3D12Resource *color,
     return NVSDK_NGX_SUCCEED(r) ? 1 : 0;
 }
 
-EXPORT void fh2ngx_shutdown(void) {
+EXPORT void azngx_shutdown(void) {
     if (!g_ready) {
         return;
     }
