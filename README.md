@@ -31,6 +31,18 @@ The mod automatically selects the correct game profile. `azimuth_dlaa.log` recor
 
 F11 works during gameplay and photo mode. If a photo-mode frame is completely stationary, the visible result may not update until the game redraws; moving the photo camera slightly forces a redraw.
 
+## Optional NVIDIA Profile Inspector tweaks
+
+These settings are not required for Azimuth-DLAA to work.
+
+DLAA presets can be forced by adding azimuth.exe to NVIDIA Profile Inspector and changing the DLSS preset there.
+
+At 4K, I found preset E (CNN) and K (Transformer Gen 1) are good choice while preset M (Transformer Gen 2) is too heavy with close to no difference.
+
+Results may vary depending on resolution.
+
+I also saw a substantial performance improvement on my system (RTX 4070 Ti Super + Ryzen 5600) by forcing Resizable BAR / ReBAR for the Azimuth.exe profile.
+
 ## Architecture
 
 The source is deliberately split so adding another game does not require another fork of the mod:
