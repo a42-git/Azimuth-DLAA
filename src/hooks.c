@@ -1037,18 +1037,66 @@ static void before_present(IDXGISwapChain *sc) {
 
 /* ---------------------------------------------------------------- swap chain */
 
+/* Present goes through the swap chain's vtable, which the Steam overlay hooks too, for every new swap
+   chain. Each of us keeps what was in the slot as its "original", so after a second swap chain the
+   Steam overlay's original can be this hook while ours is the overlay's: each Present then goes
+   hook -> overlay -> hook -> ... until the stack overflows (the game crashing as it starts, launched
+   from Steam). So a Present that comes back into this hook on the same thread goes straight to the
+   system dxgi.dll's own Present: the chain ran once, and the frame is presented once. */
+static HRESULT(STDMETHODCALLTYPE *system_Present)(IDXGISwapChain *, UINT, UINT);
+static HRESULT(STDMETHODCALLTYPE *system_Present1)(IDXGISwapChain1 *, UINT, UINT, const DXGI_PRESENT_PARAMETERS *);
+static _Thread_local int present_depth;
+
+/* What the system dxgi.dll's vtable slot held before anyone patched it: the slot's value in the
+   file on disk (mapped as an image, not relocated), moved to where dxgi.dll is loaded. NULL if the
+   slot isn't in dxgi.dll's image or the value doesn't point into it. */
+static void *system_slot_value(void **slot) {
+    HMODULE m = proxy_system_dxgi();
+    if (!m) return NULL;
+    const BYTE *base = (const BYTE *)m;
+    const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(base + ((const IMAGE_DOS_HEADER *)base)->e_lfanew);
+    const SIZE_T size = nt->OptionalHeader.SizeOfImage;
+    if ((const BYTE *)slot < base || (const BYTE *)slot + sizeof(void *) > base + size) return NULL;
+    wchar_t path[MAX_PATH];
+    if (!GetModuleFileNameW(m, path, MAX_PATH)) return NULL;
+    HMODULE file = LoadLibraryExW(path, NULL, LOAD_LIBRARY_AS_IMAGE_RESOURCE | LOAD_LIBRARY_AS_DATAFILE);
+    if (!file) return NULL;
+    const BYTE *image = (const BYTE *)((ULONG_PTR)file & ~(ULONG_PTR)3); /* the low bits flag a data file */
+    const IMAGE_NT_HEADERS *fnt = (const IMAGE_NT_HEADERS *)(image + ((const IMAGE_DOS_HEADER *)image)->e_lfanew);
+    void *value = NULL;
+    if (fnt->OptionalHeader.SizeOfImage == size) {
+        ULONG_PTR stored = *(const ULONG_PTR *)(image + ((const BYTE *)slot - base));
+        ULONG_PTR moved = stored - (ULONG_PTR)fnt->OptionalHeader.ImageBase + (ULONG_PTR)base;
+        if (moved > (ULONG_PTR)base && moved < (ULONG_PTR)base + size) value = (void *)moved;
+    }
+    FreeLibrary(file);
+    return value;
+}
+
 static HRESULT STDMETHODCALLTYPE hook_Present(IDXGISwapChain *sc, UINT sync, UINT flags) {
+    if (present_depth > 0 && system_Present) {
+        return system_Present(sc, sync, flags);
+    }
     if (!(flags & DXGI_PRESENT_TEST)) {
         before_present(sc);
     }
-    return real_Present(sc, sync, flags);
+    ++present_depth;
+    HRESULT hr = real_Present(sc, sync, flags);
+    --present_depth;
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE hook_Present1(IDXGISwapChain1 *sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS *p) {
+    if (present_depth > 0 && system_Present1) {
+        return system_Present1(sc, sync, flags, p);
+    }
     if (!(flags & DXGI_PRESENT_TEST)) {
         before_present((IDXGISwapChain *)sc);
     }
-    return real_Present1(sc, sync, flags, p);
+    ++present_depth;
+    HRESULT hr = real_Present1(sc, sync, flags, p);
+    --present_depth;
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE hook_CreateSwapChainForHwnd(IDXGIFactory2 *f, IUnknown *device, HWND hwnd,
@@ -1057,8 +1105,19 @@ static HRESULT STDMETHODCALLTYPE hook_CreateSwapChainForHwnd(IDXGIFactory2 *f, I
                                                              IDXGIOutput *out, IDXGISwapChain1 **sc) {
     HRESULT hr = real_CreateSwapChainForHwnd(f, device, hwnd, desc, fs, out, sc);
     if (SUCCEEDED(hr) && sc && *sc) {
-        patch_slot(VT_SLOT(*sc, IDXGISwapChain1Vtbl, Present), (void *)hook_Present, (void **)&real_Present);
-        patch_slot(VT_SLOT(*sc, IDXGISwapChain1Vtbl, Present1), (void *)hook_Present1, (void **)&real_Present1);
+        if (!system_Present) {
+            *(void **)&system_Present = system_slot_value(VT_SLOT(*sc, IDXGISwapChain1Vtbl, Present));
+            *(void **)&system_Present1 = system_slot_value(VT_SLOT(*sc, IDXGISwapChain1Vtbl, Present1));
+            log_msg("system dxgi Present %s, Present1 %s (for Present calls that loop back here)",
+                    system_Present ? "found" : "not found", system_Present1 ? "found" : "not found");
+        }
+        /* Once: the swap chains share dxgi's vtable. Taking the slot back for a later swap chain,
+           after the Steam overlay hooked it, made the overlay's next hook save itself as its own
+           original (a Present that calls itself until the stack overflows). */
+        if (!real_Present) {
+            patch_slot(VT_SLOT(*sc, IDXGISwapChain1Vtbl, Present), (void *)hook_Present, (void **)&real_Present);
+            patch_slot(VT_SLOT(*sc, IDXGISwapChain1Vtbl, Present1), (void *)hook_Present1, (void **)&real_Present1);
+        }
         ensure_hotkey_thread();
         log_msg("swap chain %ux%u format %d hooked", desc->Width, desc->Height, (int)desc->Format);
     }
