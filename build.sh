@@ -6,7 +6,7 @@
 # azimuth_ngx.dll is built separately with MSVC using bridge/build_bridge.bat.
 set -e
 cd "$(dirname "$0")"
-VERSION=0.2.0-alpha.1
+VERSION=0.2.1
 ZIG=${ZIG:-./zig}
 
 mkdir -p build
