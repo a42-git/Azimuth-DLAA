@@ -126,8 +126,6 @@ static HRESULT(WINAPI *real_CreateDXGIFactory)(REFIID, void **);
 static HRESULT(WINAPI *real_CreateDXGIFactory1)(REFIID, void **);
 static HRESULT(WINAPI *real_CreateDXGIFactory2)(UINT, REFIID, void **);
 static HRESULT(STDMETHODCALLTYPE *real_CreateSwapChainForHwnd)(IDXGIFactory2 *, IUnknown *, HWND, const DXGI_SWAP_CHAIN_DESC1 *, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *, IDXGIOutput *, IDXGISwapChain1 **);
-static HRESULT(STDMETHODCALLTYPE *real_Present)(IDXGISwapChain *, UINT, UINT);
-static HRESULT(STDMETHODCALLTYPE *real_Present1)(IDXGISwapChain1 *, UINT, UINT, const DXGI_PRESENT_PARAMETERS *);
 
 /* ---------------------------------------------------------------- shaders */
 
@@ -818,12 +816,34 @@ static BOOL note_scene_resources(ListState *s) {
     return TRUE;
 }
 
+/* Once per scene frame, from run_dlss: old motion-vector textures are released 8 frames after they
+   were replaced, when the GPU is done with them. This used to be counted in a Present hook, but
+   the Steam overlay hooks Present too, and with both of them on the swap chain's vtable the game
+   crashed as it started, launched from Steam (the overlay's Present calling itself until the stack
+   overflowed). Nothing else here needs Present. */
+static void count_frame(void) {
+    /* Do not drive DLSS temporal state from Present. Azimuth may own multiple
+       swap chains and their Presents are not a reliable scene-frame boundary.
+       run_dlss() now updates jitter_live directly from the DLAA evaluation result. */
+
+    InterlockedIncrement64(&present_count);
+    AcquireSRWLockExclusive(&mv_lock);
+    for (int i = 0; i < 16; ++i) {
+        if (retired[i] && present_count - retired_at[i] > 8) {
+            ID3D12Resource_Release(retired[i]);
+            retired[i] = NULL;
+        }
+    }
+    ReleaseSRWLockExclusive(&mv_lock);
+}
+
 static void run_dlss(ID3D12GraphicsCommandList *cl, ListState *s) {
     LONG64 seq = mv_seq;
     static LONG stale_resolves;
     static LONG fallback_active;
     int fallback = 0;
 
+    count_frame();
     if (!dlss_enabled() || !scene_color || !scene_depth || !mv_tex) {
         return;
     }
@@ -1018,38 +1038,7 @@ static void ensure_hotkey_thread(void) {
     CloseHandle(thread);
 }
 
-static void before_present(IDXGISwapChain *sc) {
-    (void)sc;
-    /* Do not drive DLSS temporal state from Present. Azimuth may own multiple
-       swap chains and their Presents are not a reliable scene-frame boundary.
-       run_dlss() now updates jitter_live directly from the DLAA evaluation result. */
-
-    InterlockedIncrement64(&present_count);
-    AcquireSRWLockExclusive(&mv_lock);
-    for (int i = 0; i < 16; ++i) {
-        if (retired[i] && present_count - retired_at[i] > 8) {
-            ID3D12Resource_Release(retired[i]);
-            retired[i] = NULL;
-        }
-    }
-    ReleaseSRWLockExclusive(&mv_lock);
-}
-
 /* ---------------------------------------------------------------- swap chain */
-
-static HRESULT STDMETHODCALLTYPE hook_Present(IDXGISwapChain *sc, UINT sync, UINT flags) {
-    if (!(flags & DXGI_PRESENT_TEST)) {
-        before_present(sc);
-    }
-    return real_Present(sc, sync, flags);
-}
-
-static HRESULT STDMETHODCALLTYPE hook_Present1(IDXGISwapChain1 *sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS *p) {
-    if (!(flags & DXGI_PRESENT_TEST)) {
-        before_present((IDXGISwapChain *)sc);
-    }
-    return real_Present1(sc, sync, flags, p);
-}
 
 static HRESULT STDMETHODCALLTYPE hook_CreateSwapChainForHwnd(IDXGIFactory2 *f, IUnknown *device, HWND hwnd,
                                                              const DXGI_SWAP_CHAIN_DESC1 *desc,
@@ -1057,8 +1046,6 @@ static HRESULT STDMETHODCALLTYPE hook_CreateSwapChainForHwnd(IDXGIFactory2 *f, I
                                                              IDXGIOutput *out, IDXGISwapChain1 **sc) {
     HRESULT hr = real_CreateSwapChainForHwnd(f, device, hwnd, desc, fs, out, sc);
     if (SUCCEEDED(hr) && sc && *sc) {
-        patch_slot(VT_SLOT(*sc, IDXGISwapChain1Vtbl, Present), (void *)hook_Present, (void **)&real_Present);
-        patch_slot(VT_SLOT(*sc, IDXGISwapChain1Vtbl, Present1), (void *)hook_Present1, (void **)&real_Present1);
         ensure_hotkey_thread();
         log_msg("swap chain %ux%u format %d hooked", desc->Width, desc->Height, (int)desc->Format);
     }
